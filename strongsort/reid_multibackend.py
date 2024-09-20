@@ -8,7 +8,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torchvision.transforms as T
-from yolov5.utils.general import check_requirements, check_version
+from yolov5.utils.general import check_requirements, check_version, LOGGER
 
 from strongsort.deep.models import build_model
 from strongsort.deep.reid_model_factory import (
@@ -55,7 +55,7 @@ class ReIDDetectMultiBackend(nn.Module):
     def __init__(self, weights="osnet_x0_25_msmt17.pt", device=torch.device("cpu"), fp16=False):
         super().__init__()
 
-        w = weights[0] if isinstance(weights, list) else weights
+        w = Path(weights[0] if isinstance(weights, list) else weights)
         (
             self.pt,
             self.jit,
@@ -201,7 +201,7 @@ class ReIDDetectMultiBackend(nn.Module):
     def model_type(p="path/to/model.pt"):
         # Return model type from model path, i.e. path='path/to/model.onnx' -> type=onnx
         suffixes = list(export_formats().Suffix) + [".xml"]  # export suffixes
-        check_suffix(p, suffixes)  # checks
+        check_suffix(p, suffixes + [".pth"])  # checks
         p = Path(p).name  # eliminate trailing separators
         pt, jit, onnx, xml, engine, coreml, saved_model, pb, tflite, edgetpu, tfjs, _, xml2 = (s in p for s in suffixes)
         xml |= xml2  # *_openvino_model or *.xml

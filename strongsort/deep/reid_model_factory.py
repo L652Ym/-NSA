@@ -65,11 +65,11 @@ def show_downloadeable_models():
 
 
 def get_model_url(model):
-    if model.name in __trained_urls:
-        return __trained_urls[model.name]
+    model = str(model).rsplit('/', 1)[-1]
+    if model in __trained_urls:
+        return __trained_urls[model]
     else:
         None
-
 
 def is_model_in_model_types(model):
     if model.name in __model_types:
@@ -79,8 +79,9 @@ def is_model_in_model_types(model):
 
 
 def get_model_name(model):
+    model = str(model).rsplit('/', 1)[-1].split('.')[0]
     for x in __model_types:
-        if x in model.name:
+        if x in model:
             return x
     return None
 
