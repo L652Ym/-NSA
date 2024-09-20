@@ -2,13 +2,15 @@ from collections import OrderedDict, namedtuple
 from os.path import exists as file_exists
 from pathlib import Path
 
+import cv2
 import gdown
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import torchvision.transforms as T
-from yolov5.utils.general import check_requirements, check_version
+from yolov5.utils.general import LOGGER, check_version, check_requirements
+from torchreid.utils import FeatureExtractor
 
 from strongsort.deep.models import build_model
 from strongsort.deep.reid_model_factory import (
@@ -54,8 +56,11 @@ class ReIDDetectMultiBackend(nn.Module):
     # ReID models MultiBackend class for python inference on various backends
     def __init__(self, weights="osnet_x0_25_msmt17.pt", device=torch.device("cpu"), fp16=False):
         super().__init__()
-
-        w = weights[0] if isinstance(weights, list) else weights
+        
+        if not isinstance(device, torch.device):
+            device = torch.device(device)
+        
+        w = str(weights[0] if isinstance(weights, list) else weights)
         (
             self.pt,
             self.jit,
@@ -72,7 +77,7 @@ class ReIDDetectMultiBackend(nn.Module):
             w
         )  # get backend
         self.fp16 = fp16
-        self.fp16 &= self.pt or self.jit or self.engine  # FP16
+        self.fp16 &= (self.pt or self.jit or self.onnx or self.engine) and device.type != 'cpu'  # FP16
 
         # Build transform functions
         self.device = device
@@ -86,28 +91,25 @@ class ReIDDetectMultiBackend(nn.Module):
         self.preprocess = T.Compose(self.transforms)
         self.to_pil = T.ToPILImage()
         model_name = get_model_name(w)
-
-        if w.suffix == ".pt":
+        if self.pt:  # PyTorch
             model_url = get_model_url(w)
             if not file_exists(w) and model_url is not None:
                 gdown.download(model_url, str(w), quiet=False)
             elif file_exists(w):
                 pass
-            else:
+            elif model_url is None:
                 print(f"No URL associated to the chosen StrongSORT weights ({w}). Choose between:")
                 show_downloadeable_models()
                 exit()
 
-        # Build model
-        self.model = build_model(model_name, num_classes=1, pretrained=not (w and w.is_file()), use_gpu=device)
-
-        if self.pt:  # PyTorch
-            # populate model arch with weights
-            if w and w.is_file() and w.suffix == ".pt":
-                load_pretrained_weights(self.model, w)
-
-            self.model.to(device).eval()
-            self.model.half() if self.fp16 else self.model.float()
+            self.extractor = FeatureExtractor(
+                # get rid of dataset information DeepSort model name
+                model_name=model_name,
+                model_path=weights,
+                device=str(device)
+            )
+            
+            self.extractor.model.half() if fp16 else  self.extractor.model.float()
         elif self.jit:
             LOGGER.info(f"Loading {w} for TorchScript inference...")
             self.model = torch.jit.load(w)
@@ -123,10 +125,7 @@ class ReIDDetectMultiBackend(nn.Module):
         elif self.engine:  # TensorRT
             LOGGER.info(f"Loading {w} for TensorRT inference...")
             import tensorrt as trt  # https://developer.nvidia.com/nvidia-tensorrt-download
-
             check_version(trt.__version__, "7.0.0", hard=True)  # require tensorrt>=7.0.0
-            if device.type == "cpu":
-                device = torch.device("cuda:0")
             Binding = namedtuple("Binding", ("name", "dtype", "shape", "data", "ptr"))
             logger = trt.Logger(trt.Logger.INFO)
             with open(w, "rb") as f, trt.Runtime(logger) as runtime:
@@ -201,78 +200,78 @@ class ReIDDetectMultiBackend(nn.Module):
     def model_type(p="path/to/model.pt"):
         # Return model type from model path, i.e. path='path/to/model.onnx' -> type=onnx
         suffixes = list(export_formats().Suffix) + [".xml"]  # export suffixes
-        check_suffix(p, suffixes)  # checks
+        check_suffix(p, suffixes + [".pth"])  # checks
         p = Path(p).name  # eliminate trailing separators
-        pt, jit, onnx, xml, engine, coreml, saved_model, pb, tflite, edgetpu, tfjs, _, xml2 = (s in p for s in suffixes)
+        pt, jit, onnx, xml, engine, coreml, saved_model, pb, tflite, edgetpu, tfjs, xml2, _ = (s in p for s in suffixes)
         xml |= xml2  # *_openvino_model or *.xml
         tflite &= not edgetpu  # *.tflite
         return pt, jit, onnx, xml, engine, coreml, saved_model, pb, tflite, edgetpu, tfjs
 
-    def _preprocess(self, im_batch):
+    def preprocess(self, im_batch):
+        def _resize(im, size):
+            return cv2.resize(im.astype(np.float32), size)
 
-        images = []
-        for element in im_batch:
-            image = self.to_pil(element)
-            image = self.preprocess(image)
-            images.append(image)
-
-        images = torch.stack(images, dim=0)
-        images = images.to(self.device)
-
-        return images
+        im = torch.cat([self.norm(_resize(im, self.size)).unsqueeze(0) for im in im_crops], dim=0).float()
+        im = im.float().to(device=self.device)
+        return im
 
     def forward(self, im_batch):
 
         # preprocess batch
-        im_batch = self._preprocess(im_batch)
-
-        # batch to half
-        if self.fp16 and im_batch.dtype != torch.float16:
-            im_batch = im_batch.half()
-
-        # batch processing
+        im_batch = self.preprocess(im_batch)
+        b, ch, h, w = im_batch.shape  # batch, channel, height, width
         features = []
-        if self.pt:
-            features = self.model(im_batch)
-        elif self.jit:  # TorchScript
-            features = self.model(im_batch)
-        elif self.onnx:  # ONNX Runtime
-            im_batch = im_batch.cpu().numpy()  # torch to numpy
-            features = self.session.run(
-                [self.session.get_outputs()[0].name], {self.session.get_inputs()[0].name: im_batch}
-            )[0]
-        elif self.engine:  # TensorRT
-            if True and im_batch.shape != self.bindings["images"].shape:
-                i_in, i_out = (self.model_.get_binding_index(x) for x in ("images", "output"))
-                self.context.set_binding_shape(i_in, im_batch.shape)  # reshape if dynamic
-                self.bindings["images"] = self.bindings["images"]._replace(shape=im_batch.shape)
-                self.bindings["output"].data.resize_(tuple(self.context.get_binding_shape(i_out)))
-            s = self.bindings["images"].shape
-            assert (
-                im_batch.shape == s
-            ), f"input size {im_batch.shape} {'>' if self.dynamic else 'not equal to'} max model size {s}"
-            self.binding_addrs["images"] = int(im_batch.data_ptr())
-            self.context.execute_v2(list(self.binding_addrs.values()))
-            features = self.bindings["output"].data
-        elif self.xml:  # OpenVINO
-            im_batch = im_batch.cpu().numpy()  # FP32
-            features = self.executable_network([im_batch])[self.output_layer]
-        else:
-            print("Framework not supported at the moment, we are working on it...")
-            exit()
+        for i in range(0, im_batch.shape[0]):
+            im = im_batch[i, :, :, :].unsqueeze(0)
+            if self.fp16 and im.dtype != torch.float16:
+                im = im.half()  # to FP16
+            if self.pt:  # PyTorch
+                y = self.extractor.model(im)[0]
+            elif self.jit:  # TorchScript
+                y = self.model(im)[0]
+            elif self.onnx:  # ONNX Runtime
+                im = im.permute(0, 1, 3, 2).cpu().numpy()  # torch to numpy
+                y = self.session.run([self.session.get_outputs()[0].name], {self.session.get_inputs()[0].name: im})[0]
+            elif self.xml:  # OpenVINO
+                im = im.cpu().numpy()  # FP32
+                y = self.executable_network([im])[self.output_layer]
+            elif self.engine:  # TensorRT
+                im = im.permute(0, 1, 3, 2)
+                if self.dynamic and im.shape != self.bindings['images'].shape:
+                    i_in, i_out = (self.model.get_binding_index(x) for x in ('images', 'output'))
+                    self.context.set_binding_shape(i_in, im.shape)  # reshape if dynamic
+                    self.bindings['images'] = self.bindings['images']._replace(shape=im.shape)
+                    self.bindings['output'].data.resize_(tuple(self.context.get_binding_shape(i_out)))
+                s = self.bindings['images'].shape
+                assert im.shape == s, f"input size {im.shape} {'>' if self.dynamic else 'not equal to'} max model size {s}"
+                self.binding_addrs['images'] = int(im.data_ptr())
+                self.context.execute_v2(list(self.binding_addrs.values()))
+                y = self.bindings['output'].data
+            else:  # TensorFlow (SavedModel, GraphDef, Lite, Edge TPU)
+                im = im.permute(0, 3, 2, 1).cpu().numpy()  # torch BCHW to numpy BHWC shape(1,320,192,3)
+                input, output = self.input_details[0], self.output_details[0]
+                int8 = input['dtype'] == np.uint8  # is TFLite quantized uint8 model
+                if int8:
+                    scale, zero_point = input['quantization']
+                    im = (im / scale + zero_point).astype(np.uint8)  # de-scale
+                self.interpreter.set_tensor(input['index'], im)
+                self.interpreter.invoke()
+                y = torch.tensor(self.interpreter.get_tensor(output['index']))
+                if int8:
+                    scale, zero_point = output['quantization']
+                    y = (y.astype(np.float32) - zero_point) * scale  # re-scale
+            
+            if isinstance(y, np.ndarray):
+                y = torch.tensor(y, device=self.device)
+            features.append(y.squeeze())
+    
+        return features
 
-        if isinstance(features, (list, tuple)):
-            return self.from_numpy(features[0]) if len(features) == 1 else [self.from_numpy(x) for x in features]
-        else:
-            return self.from_numpy(features)
-
-    def from_numpy(self, x):
-        return torch.from_numpy(x).to(self.device) if isinstance(x, np.ndarray) else x
-
-    def warmup(self, imgsz=[(256, 128, 3)]):
+    def warmup(self, imgsz=(1, 256, 128, 3)):
         # Warmup model by running inference once
         warmup_types = self.pt, self.jit, self.onnx, self.engine, self.saved_model, self.pb
         if any(warmup_types) and self.device.type != "cpu":
-            im = [np.empty(*imgsz).astype(np.uint8)]  # input
+            im = torch.zeros(*imgsz, dtype=torch.half if self.fp16 else torch.float, device=self.device)  # input
+            im = im.cpu().numpy()
             for _ in range(2 if self.jit else 1):  #
                 self.forward(im)  # warmup
