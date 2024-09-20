@@ -14,22 +14,27 @@
 ## <div align="center">Overview</div>
 
 This repo is a packaged version of the [StrongSort](https://github.com/dyhBUPT/StrongSORT) algorithm.
+
 ### Installation
+
 ```
 pip install strongsort
 ```
 
-### Detection Model + StrongSort 
+### Detection Model + StrongSort
+
 ```python
-from strong_sort import StrongSORT
+from strongsort import StrongSORT
 
 tracker = StrongSORT(model_weights='model.pth', device='cuda')
 pred = model(img)
-for i, det in enumerate(pred):
-    det[i] = tracker[i].update(detection, im0s)
+for i, dets in enumerate(pred):
+    # dets: [x1, y1, x2, y2, confidence, class]
+    tracks = tracker.update(dets, ori_img=frame)
 ```
 
 ## Citations
+
 ```bibtex
 @article{du2022strongsort,
   title={Strongsort: Make deepsort great again},
