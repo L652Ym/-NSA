@@ -75,6 +75,9 @@ class Track:
         self.time_since_update = 0
         self.ema_alpha = ema_alpha
 
+        # 添加运动模式属性
+        self.motion_mode = "normal"  # 初始化为正常模式
+
         self.state = TrackState.Tentative
         self.features = []
         if feature is not None:
@@ -245,6 +248,8 @@ class Track:
 
         """
         self.mean, self.covariance = self.kf.predict(self.mean, self.covariance)
+        # 更新运动模式
+        self.motion_mode = self.kf.current_motion_mode
         self.age += 1
         self.time_since_update += 1
 
@@ -261,6 +266,8 @@ class Track:
         self.mean, self.covariance = self.kf.update(
             self.mean, self.covariance, detection.to_xyah(), detection.confidence
         )
+        # 更新运动模式
+        self.motion_mode = self.kf.current_motion_mode
 
         feature = detection.feature / np.linalg.norm(detection.feature)
 
