@@ -20,6 +20,8 @@ class KalmanFilter(object):
     Object motion follows a constant velocity model. The bounding box location
     (x, y, a, h) is taken as direct observation of the state space (linear
     observation model).
+
+    增强版: 自适应过程噪声和运动模式识别，专为马拉松场景设计
     """
 
     def __init__(self):
@@ -37,6 +39,63 @@ class KalmanFilter(object):
         # the model. This is a bit hacky.
         self._std_weight_position = 1.0 / 20
         self._std_weight_velocity = 1.0 / 160
+
+        # 自适应参数
+        self.acceleration_factor = 0.5  # 加速度影响因子
+        self.velocity_history = []  # 速度历史记录
+        self.history_max_size = 5  # 历史记录最大长度
+        self.previous_velocity = None  # 上一时刻速度
+        self.velocity_change_threshold = 0.3  # 速度变化阈值
+
+        # 运动模式分类参数
+        self.current_motion_mode = "normal"  # 默认为正常运动模式
+        self.motion_modes = {
+            "normal": 1.0,  # 正常跑步 - 基础噪声水平
+            "acceleration": 1.5,  # 加速 - 提高速度噪声
+            "deceleration": 1.2,  # 减速 - 提高位置噪声
+            "turn": 1.3,  # 转弯 - 提高角度噪声
+            "stop": 0.8  # 停止 - 降低速度噪声
+        }
+
+    def classify_motion_pattern(self, current_velocity):
+        """
+        基于速度历史识别当前运动模式
+        """
+        if self.previous_velocity is None:
+            return "normal"
+
+        # 计算速度变化
+        velocity_delta = current_velocity - self.previous_velocity
+        position_velocity_change = np.linalg.norm(velocity_delta[:2])  # 仅考虑x,y速度变化
+
+        # 更新速度历史
+        self.velocity_history.append(current_velocity[:2])  # 仅存储x,y速度
+        if len(self.velocity_history) > self.history_max_size:
+            self.velocity_history.pop(0)
+
+        # 计算当前速度大小
+        current_speed = np.linalg.norm(current_velocity[:2])
+
+        # 运动模式识别逻辑
+        if current_speed < 0.1:
+            return "stop"
+        elif position_velocity_change > self.velocity_change_threshold:
+            # 判断是加速还是减速
+            if np.dot(self.previous_velocity[:2], velocity_delta[:2]) > 0:
+                return "acceleration"
+            else:
+                return "deceleration"
+
+        # 检测转弯 - 通过判断速度方向变化
+        if len(self.velocity_history) >= 2:
+            prev_direction = self.velocity_history[-2] / (np.linalg.norm(self.velocity_history[-2]) + 1e-6)
+            curr_direction = current_velocity[:2] / (np.linalg.norm(current_velocity[:2]) + 1e-6)
+            direction_change = np.arccos(np.clip(np.dot(prev_direction, curr_direction), -1.0, 1.0))
+
+            if direction_change > 0.3:  # 约17度
+                return "turn"
+
+        return "normal"
 
     def initiate(self, measurement):
         """Create track from unassociated measurement.
@@ -67,6 +126,12 @@ class KalmanFilter(object):
             10 * self._std_weight_velocity * measurement[3],
         ]
         covariance = np.diag(np.square(std))
+
+        # 初始化自适应参数
+        self.previous_velocity = mean_vel
+        self.velocity_history = []
+        self.current_motion_mode = "normal"
+
         return mean, covariance
 
     def predict(self, mean, covariance):
@@ -85,20 +150,80 @@ class KalmanFilter(object):
             Returns the mean vector and covariance matrix of the predicted
             state. Unobserved velocities are initialized to 0 mean.
         """
+        # 提取当前速度分量
+        current_velocity = mean[4:8]
+
+        # 识别运动模式
+        if self.previous_velocity is not None:
+            self.current_motion_mode = self.classify_motion_pattern(current_velocity)
+
+        # 根据运动模式获取噪声调整因子
+        mode_factor = self.motion_modes.get(self.current_motion_mode, 1.0)
+
+        # 计算加速度及其大小
+        acceleration = np.zeros_like(current_velocity)
+        if self.previous_velocity is not None:
+            acceleration = current_velocity - self.previous_velocity
+        self.previous_velocity = current_velocity.copy()
+
+        # 计算速度变化率 (主要考虑x,y方向)
+        velocity_change_rate = np.linalg.norm(acceleration[:2])
+
+        # 动态调整噪声系数
+        adaptive_factor = 1.0 + self.acceleration_factor * velocity_change_rate
+        noise_factor = adaptive_factor * mode_factor
+
+        # 调整标准差 - 根据当前状态和变化率动态调整
         std_pos = [
             self._std_weight_position * mean[0],
             self._std_weight_position * mean[1],
             1 * mean[2],
             self._std_weight_position * mean[3],
         ]
-        std_vel = [
-            self._std_weight_velocity * mean[0],
-            self._std_weight_velocity * mean[1],
-            0.1 * mean[2],
-            self._std_weight_velocity * mean[3],
-        ]
+
+        # 速度不确定性 - 根据运动模式和速度变化进行调整
+        if self.current_motion_mode == "acceleration":
+            # 加速模式下，增加速度状态的不确定性
+            std_vel = [
+                self._std_weight_velocity * mean[0] * noise_factor,
+                self._std_weight_velocity * mean[1] * noise_factor,
+                0.1 * mean[2],
+                self._std_weight_velocity * mean[3]
+            ]
+        elif self.current_motion_mode == "deceleration":
+            # 减速模式下，更多考虑位置不确定性
+            std_pos = [x * noise_factor for x in std_pos]
+            std_vel = [
+                self._std_weight_velocity * mean[0],
+                self._std_weight_velocity * mean[1],
+                0.1 * mean[2],
+                self._std_weight_velocity * mean[3]
+            ]
+        elif self.current_motion_mode == "turn":
+            # 转弯模式下，调整宽高比的不确定性
+            std_vel = [
+                self._std_weight_velocity * mean[0] * noise_factor,
+                self._std_weight_velocity * mean[1] * noise_factor,
+                0.1 * mean[2] * noise_factor,  # 增加宽高比速度不确定性
+                self._std_weight_velocity * mean[3]
+            ]
+        else:
+            # 正常或停止模式
+            std_vel = [
+                self._std_weight_velocity * mean[0],
+                self._std_weight_velocity * mean[1],
+                0.1 * mean[2],
+                self._std_weight_velocity * mean[3]
+            ]
+
+            if self.current_motion_mode == "stop":
+                # 停止模式 - 减小速度不确定性
+                std_vel = [x * 0.5 for x in std_vel]
+
+        # 创建过程噪声矩阵
         motion_cov = np.diag(np.square(np.r_[std_pos, std_vel]))
 
+        # 应用运动模型
         mean = np.dot(self._motion_mat, mean)
         covariance = np.linalg.multi_dot((self._motion_mat, covariance, self._motion_mat.T)) + motion_cov
 
@@ -112,13 +237,17 @@ class KalmanFilter(object):
             The state's mean vector (8 dimensional array).
         covariance : ndarray
             The state's covariance matrix (8x8 dimensional).
-        confidence: (dyh) 检测框置信度
+        confidence: float
+            检测框置信度
         Returns
         -------
         (ndarray, ndarray)
             Returns the projected mean and covariance matrix of the given state
             estimate.
         """
+        # 调整测量噪声 - 根据运动模式和检测置信度
+        mode_factor = self.motion_modes.get(self.current_motion_mode, 1.0)
+
         std = [
             self._std_weight_position * mean[3],
             self._std_weight_position * mean[3],
@@ -126,7 +255,9 @@ class KalmanFilter(object):
             self._std_weight_position * mean[3],
         ]
 
-        std = [(1 - confidence) * x for x in std]
+        # 根据置信度和运动模式调整噪声
+        confidence_factor = max(0.1, 1.0 - confidence)  # 确保至少有一些噪声
+        std = [s * confidence_factor * mode_factor for s in std]
 
         innovation_cov = np.diag(np.square(std))
 
@@ -146,7 +277,8 @@ class KalmanFilter(object):
             The 4 dimensional measurement vector (x, y, a, h), where (x, y)
             is the center position, a the aspect ratio, and h the height of the
             bounding box.
-        confidence: (dyh)检测框置信度
+        confidence: float
+            检测框置信度
         Returns
         -------
         (ndarray, ndarray)
@@ -159,6 +291,23 @@ class KalmanFilter(object):
             (chol_factor, lower), np.dot(covariance, self._update_mat.T).T, check_finite=False
         ).T
         innovation = measurement - projected_mean
+
+        # 根据运动模式调整创新权重
+        if self.current_motion_mode == "acceleration":
+            # 加速模式下，更信任测量
+            innovation_weight = 1.2
+        elif self.current_motion_mode == "deceleration":
+            # 减速模式下，适度信任测量
+            innovation_weight = 1.1
+        elif self.current_motion_mode == "turn":
+            # 转弯模式下，更信任测量
+            innovation_weight = 1.3
+        else:
+            # 正常模式，标准权重
+            innovation_weight = 1.0
+
+        # 应用加权创新
+        innovation = innovation * innovation_weight
 
         new_mean = mean + np.dot(innovation, kalman_gain.T)
         new_covariance = covariance - np.linalg.multi_dot((kalman_gain, projected_cov, kalman_gain.T))
@@ -199,4 +348,18 @@ class KalmanFilter(object):
         d = measurements - mean
         z = scipy.linalg.solve_triangular(cholesky_factor, d.T, lower=True, check_finite=False, overwrite_b=True)
         squared_maha = np.sum(z * z, axis=0)
+
+        # 动态调整门控阈值 - 根据运动模式
+        if not only_position:
+            dims = 4  # 完整状态空间维度
+            base_threshold = chi2inv95[dims]
+
+            # 根据运动模式调整门控阈值
+            if self.current_motion_mode == "acceleration":
+                # 加速时使用更宽松的门控
+                return squared_maha / (base_threshold * 1.3)
+            elif self.current_motion_mode == "turn":
+                # 转弯时使用更宽松的门控
+                return squared_maha / (base_threshold * 1.4)
+
         return squared_maha
