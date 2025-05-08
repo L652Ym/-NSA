@@ -6,6 +6,7 @@ from strongsort.sort.detection import Detection
 from strongsort.sort.nn_matching import NearestNeighborDistanceMetric
 from strongsort.sort.tracker import Tracker
 
+
 def xyxy2xywh(x):
     # Convert nx4 boxes from [x1, y1, x2, y2] to [x, y, w, h] where xy1=top-left, xy2=bottom-right
     y = x.clone() if isinstance(x, torch.Tensor) else np.copy(x)
@@ -15,26 +16,34 @@ def xyxy2xywh(x):
     y[:, 3] = x[:, 3] - x[:, 1]  # height
     return y
 
+
 class StrongSORT(object):
     def __init__(
-        self,
-        model_weights,
-        device,
-        fp16,
-        max_dist=0.2,
-        max_iou_distance=0.7,
-        max_age=70,
-        n_init=3,
-        nn_budget=100,
-        mc_lambda=0.995,
-        ema_alpha=0.9,
+            self,
+            model_weights,
+            device,
+            fp16,
+            max_dist=0.2,
+            max_iou_distance=0.7,
+            max_age=70,
+            n_init=3,
+            nn_budget=100,
+            mc_lambda=0.995,
+            ema_alpha=0.9,
     ):
 
         self.model = ReIDDetectMultiBackend(weights=model_weights, device=device, fp16=fp16)
 
         self.max_dist = max_dist
         metric = NearestNeighborDistanceMetric("cosine", self.max_dist, nn_budget)
-        self.tracker = Tracker(metric, max_iou_distance=max_iou_distance, max_age=max_age, n_init=n_init)
+        self.tracker = Tracker(
+            metric,
+            max_iou_distance=max_iou_distance,
+            max_age=max_age,
+            n_init=n_init,
+            ema_alpha=ema_alpha,
+            mc_lambda=mc_lambda
+        )
 
     def update(self, dets, ori_img):
         xyxys = dets[:, :4]
@@ -72,7 +81,14 @@ class StrongSORT(object):
             track_id = track.track_id
             class_id = track.class_id
             conf = track.conf
-            outputs.append(np.array([x1, y1, x2, y2, track_id, class_id, conf]))
+
+            # Add occlusion info to outputs if needed
+            is_occluded = False
+            if hasattr(track, 'is_occluded'):
+                is_occluded = track.is_occluded
+
+            outputs.append(np.array([x1, y1, x2, y2, track_id, class_id, conf, int(is_occluded)]))
+
         if len(outputs) > 0:
             outputs = np.stack(outputs, axis=0)
         return outputs
