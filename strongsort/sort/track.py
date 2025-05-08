@@ -75,14 +75,29 @@ class Track:
         self.time_since_update = 0
         self.ema_alpha = ema_alpha
 
-        # 添加运动模式属性
-        self.motion_mode = "normal"  # 初始化为正常模式
+        # Motion mode attributes
+        self.motion_mode = "normal"
+
+        # Occlusion attributes
+        self.is_occluded = False
+        self.occluded_by = None
+        self.occlusion_count = 0
+        self.original_max_age = max_age
+
+        # Enhanced appearance modeling
+        self.max_features_memory = 10
+        self.features_memory = []
+        self.feature_quality_scores = []
+        self.attention_weights = np.array([0.3, 0.4, 0.3])  # top, middle, bottom regions
+        self.motion_appearance_correlation = []
 
         self.state = TrackState.Tentative
         self.features = []
         if feature is not None:
             feature /= np.linalg.norm(feature)
             self.features.append(feature)
+            self.features_memory.append(feature)
+            self.feature_quality_scores.append(1.0)  # Initial feature quality
 
         self.conf = conf
         self._n_init = n_init
@@ -248,10 +263,143 @@ class Track:
 
         """
         self.mean, self.covariance = self.kf.predict(self.mean, self.covariance)
-        # 更新运动模式
+        # Update motion mode
         self.motion_mode = self.kf.current_motion_mode
         self.age += 1
         self.time_since_update += 1
+
+        # Handle occlusion differently during prediction
+        if self.is_occluded:
+            self.occlusion_count += 1
+            # Increase allowed age when occluded to avoid premature deletion
+            self._max_age = max(self.original_max_age, 30 + self.occlusion_count)
+        else:
+            self._max_age = self.original_max_age
+
+    def _is_feature_reliable(self, detection):
+        """Determine if current detection feature is reliable (not from occlusion)"""
+        # Simple occlusion check based on aspect ratio change
+        current_bbox = detection.tlwh
+        current_aspect_ratio = current_bbox[2] / current_bbox[3]
+
+        # Check if the aspect ratio has changed drastically
+        expected_aspect_ratio = self.mean[2]  # From Kalman filter state
+        aspect_ratio_change = abs(current_aspect_ratio - expected_aspect_ratio) / expected_aspect_ratio
+
+        if aspect_ratio_change > 0.3:  # 30% change threshold
+            return 0.5  # Lower quality score for potentially occluded feature
+
+        # Check detection confidence
+        if detection.confidence < 0.5:
+            return max(0.5, detection.confidence)
+
+        return 1.0  # High quality score for reliable feature
+
+    def _update_motion_appearance_correlation(self, feature):
+        """Track correlation between motion patterns and appearance changes"""
+        if len(self.features) > 1:
+            prev_feature = self.features[-2]
+            feature_change = np.linalg.norm(feature - prev_feature)
+
+            # Store motion mode with feature change magnitude
+            self.motion_appearance_correlation.append((self.motion_mode, feature_change))
+
+            # Keep history limited
+            if len(self.motion_appearance_correlation) > 20:
+                self.motion_appearance_correlation.pop(0)
+
+    def get_appearance_similarity(self, feature):
+        """Compute appearance similarity using the feature memory bank with quality weighting"""
+        if not self.features_memory:
+            return 0
+
+        if feature is None:
+            return 0
+
+        # Normalize feature if needed
+        if np.linalg.norm(feature) > 0:
+            feature = feature / np.linalg.norm(feature)
+
+        # Compute similarities with all stored features, weighted by quality
+        weighted_similarities = []
+        for i, feat in enumerate(self.features_memory):
+            # Compute cosine similarity
+            sim = np.dot(feature, feat)
+            # Apply quality weight if available
+            if i < len(self.feature_quality_scores):
+                sim *= self.feature_quality_scores[i]
+            weighted_similarities.append(sim)
+
+        # Return maximum similarity
+        return max(weighted_similarities) if weighted_similarities else 0
+
+    def update_appearance_model(self, detection):
+        """Enhanced appearance model update with adaptive feature fusion"""
+        # Fix the error here - assign detection.feature to a variable first
+        feature = detection.feature
+        feature = feature / np.linalg.norm(feature)
+
+        # Simple check if this feature is reliable (not occluded)
+        quality_score = self._is_feature_reliable(detection)
+
+        # Rest of the function remains the same...
+        # Apply regional attention weighting (assuming the feature can be divided into 3 parts)
+        if feature.shape[0] % 3 == 0:  # Can be divided into 3 parts
+            region_size = feature.shape[0] // 3
+            weighted_feature = np.zeros_like(feature)
+
+            for i in range(3):
+                start_idx = i * region_size
+                end_idx = (i + 1) * region_size
+                weighted_feature[start_idx:end_idx] = feature[start_idx:end_idx] * self.attention_weights[i]
+
+            # Normalize the weighted feature
+            if np.linalg.norm(weighted_feature) > 0:
+                weighted_feature /= np.linalg.norm(weighted_feature)
+                feature = weighted_feature
+
+        # Adaptive EMA based on detection confidence and motion mode
+        adaptive_alpha = self.ema_alpha
+
+        # Adjust alpha based on motion mode - lower alpha during rapid changes
+        if self.motion_mode == "acceleration" or self.motion_mode == "turn":
+            adaptive_alpha = max(0.7, self.ema_alpha)  # Rely more on current observation
+        elif self.motion_mode == "stop":
+            adaptive_alpha = min(0.95, self.ema_alpha)  # Rely more on history
+
+        # Adjust alpha based on detection confidence and occlusion status
+        confidence_factor = max(0.5, detection.confidence)
+        adaptive_alpha *= confidence_factor
+
+        if self.is_occluded:
+            # If coming out of occlusion, rely more on the new observation
+            adaptive_alpha = max(0.6, adaptive_alpha)
+
+        # Update feature representation with adaptive EMA
+        if len(self.features) > 0:
+            smooth_feat = adaptive_alpha * self.features[-1] + (1 - adaptive_alpha) * feature
+            smooth_feat /= np.linalg.norm(smooth_feat)
+            self.features = [smooth_feat]
+        else:
+            self.features = [feature]
+
+        # Update feature memory
+        self.features_memory.append(feature)
+        self.feature_quality_scores.append(quality_score)
+
+        if len(self.features_memory) > self.max_features_memory:
+            self.features_memory.pop(0)
+            self.feature_quality_scores.pop(0)
+
+        # Update motion-appearance correlation
+        self._update_motion_appearance_correlation(feature)
+
+        # Reset occlusion state if we're getting updates
+        if self.is_occluded:
+            self.is_occluded = False
+            self.occluded_by = None
+            self.occlusion_count = 0
+            self._max_age = self.original_max_age
 
     def update(self, detection, class_id, conf):
         """Perform Kalman filter measurement update step and update the feature
@@ -263,17 +411,15 @@ class Track:
         """
         self.conf = conf
         self.class_id = class_id.int()
+        # Use detection confidence for Kalman update
         self.mean, self.covariance = self.kf.update(
             self.mean, self.covariance, detection.to_xyah(), detection.confidence
         )
-        # 更新运动模式
+        # Update motion mode
         self.motion_mode = self.kf.current_motion_mode
 
-        feature = detection.feature / np.linalg.norm(detection.feature)
-
-        smooth_feat = self.ema_alpha * self.features[-1] + (1 - self.ema_alpha) * feature
-        smooth_feat /= np.linalg.norm(smooth_feat)
-        self.features = [smooth_feat]
+        # Use enhanced appearance model update
+        self.update_appearance_model(detection)
 
         self.hits += 1
         self.time_since_update = 0
